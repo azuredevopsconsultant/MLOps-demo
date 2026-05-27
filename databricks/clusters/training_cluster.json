@@ -1,0 +1,23 @@
+{
+  "cluster_name": "mlops-training",
+  "spark_version": "15.4.x-scala2.12",
+  "node_type_id": "i3.4xlarge",
+  "driver_node_type_id": "i3.xlarge",
+  "autoscale": { "min_workers": 2, "max_workers": 10 },
+  "aws_attributes": {
+    "availability": "SPOT_WITH_FALLBACK",
+    "spot_bid_price_percent": 80,
+    "ebs_volume_type": "GENERAL_PURPOSE_SSD",
+    "ebs_volume_count": 1,
+    "ebs_volume_size": 100
+  },
+  "spark_conf": {
+    "spark.databricks.delta.preview.enabled": "true",
+    "spark.sql.adaptive.enabled": "true",
+    "spark.sql.adaptive.coalescePartitions.enabled": "true",
+    "spark.databricks.delta.optimizeWrite.enabled": "true",
+    "spark.databricks.delta.autoCompact.enabled": "true"
+  },
+  "autotermination_minutes": 30,
+  "custom_tags": { "team": "mlops", "cost_centre": "ml-training" }
+}

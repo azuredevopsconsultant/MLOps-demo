@@ -1,0 +1,60 @@
+name: CI — Lint · Test · Quality Gate
+
+on:
+  pull_request:
+    branches: [main, staging]
+  push:
+    branches: [develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true          # cancel stale runs → save Actions minutes
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip                  # cache deps → faster builds
+      - run: pip install -e ".[dev]" --quiet
+      - run: ruff check src/ pipelines/ tests/ --output-format=github
+      - run: mypy src/ pipelines/ --ignore-missing-imports
+
+  unit-tests:
+    name: Unit + data-quality tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]" --quiet
+      - run: |
+          pytest tests/unit tests/data_quality \
+            -v --tb=short \
+            --cov=src --cov=pipelines \
+            --cov-report=xml \
+            --cov-fail-under=80
+      - uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+
+  security-scan:
+    name: Security scan (bandit + pip-audit)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install bandit pip-audit --quiet
+      - run: bandit -r src/ pipelines/ -ll -q
+      - run: pip-audit --desc --format=json -o pip-audit.json || true
+      - uses: actions/upload-artifact@v4
+        with: { name: pip-audit, path: pip-audit.json }

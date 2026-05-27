@@ -1,0 +1,9 @@
+{
+  "cluster_name": "mlops-serving",
+  "spark_version": "15.4.x-scala2.12",
+  "node_type_id": "i3.xlarge",
+  "num_workers": 2,
+  "aws_attributes": { "availability": "ON_DEMAND" },
+  "autotermination_minutes": 60,
+  "custom_tags": { "team": "mlops", "cost_centre": "ml-serving" }
+}

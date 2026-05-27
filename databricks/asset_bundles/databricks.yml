@@ -1,0 +1,180 @@
+bundle:
+  name: mlops-demo
+
+# ── Cost optimisation: shared job cluster pool ─────────────────
+# All jobs draw from this pool → skip JVM cold-start (~2 min saved per run)
+resources:
+  instance_pools:
+    ml_pool:
+      name: mlops-shared-pool
+      min_idle_instances: 0          # 0 idle → $0 when no jobs running
+      max_capacity: 40
+      node_type_id: i3.2xlarge
+      idle_instance_autotermination_minutes: 10
+      aws_attributes:
+        availability: SPOT_WITH_FALLBACK
+        spot_bid_price_percent: 80   # bid 80% of on-demand → ~60% savings
+
+  jobs:
+    # ── Ingestion (Bronze) ─────────────────────────────────────
+    bronze_ingest_job:
+      name: "[${bundle.target}] Bronze Ingestion"
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"   # hourly
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      job_clusters:
+        - job_cluster_key: ingest_cluster
+          new_cluster:
+            num_workers: 2           # small — Auto Loader is I/O bound not CPU
+            node_type_id: i3.xlarge  # cheaper single-AZ node
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.autoCompact.enabled: "true"
+      tasks:
+        - task_key: bronze_ingest
+          python_wheel_task:
+            package_name: mlops_demo
+            entry_point: bronze_ingest
+          job_cluster_key: ingest_cluster
+          libraries:
+            - whl: ./dist/mlops_demo-*.whl
+
+    # ── Transformation (Silver) ────────────────────────────────
+    silver_transform_job:
+      name: "[${bundle.target}] Silver Transform"
+      schedule:
+        quartz_cron_expression: "0 30 * * * ?"  # 30 min after bronze
+        timezone_id: UTC
+      job_clusters:
+        - job_cluster_key: transform_cluster
+          new_cluster:
+            autoscale:
+              min_workers: 2
+              max_workers: 8         # scale out for large batches, back to 2 when done
+            node_type_id: i3.2xlarge
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+            spark_conf:
+              spark.sql.adaptive.enabled: "true"
+              spark.sql.adaptive.coalescePartitions.enabled: "true"
+              spark.sql.shuffle.partitions: "auto"
+      tasks:
+        - task_key: silver_transform
+          python_wheel_task:
+            package_name: mlops_demo
+            entry_point: silver_transform
+          job_cluster_key: transform_cluster
+
+    # ── Feature Engineering (Gold) ─────────────────────────────
+    gold_features_job:
+      name: "[${bundle.target}] Gold Feature Engineering"
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"  # 02:00 UTC daily (off-peak)
+        timezone_id: UTC
+      job_clusters:
+        - job_cluster_key: feature_cluster
+          new_cluster:
+            autoscale:
+              min_workers: 2
+              max_workers: 12
+            node_type_id: i3.4xlarge
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+            enable_elastic_disk: true
+
+    # ── Training ───────────────────────────────────────────────
+    training_job:
+      name: "[${bundle.target}] Model Training"
+      job_clusters:
+        - job_cluster_key: training_cluster
+          new_cluster:
+            num_workers: 4
+            node_type_id: i3.4xlarge
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+            spark_conf:
+              spark.databricks.mlflow.trackMLlib.enabled: "true"
+      tasks:
+        - task_key: train
+          python_wheel_task:
+            package_name: mlops_demo
+            entry_point: train_model
+          job_cluster_key: training_cluster
+        - task_key: validate
+          depends_on: [{ task_key: train }]
+          python_wheel_task:
+            package_name: mlops_demo
+            entry_point: validate_model
+          job_cluster_key: training_cluster
+
+    # ── Batch Inference ────────────────────────────────────────
+    batch_inference_job:
+      name: "[${bundle.target}] Batch Inference"
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"  # 06:00 UTC daily
+        timezone_id: UTC
+      job_clusters:
+        - job_cluster_key: inference_cluster
+          new_cluster:
+            autoscale:
+              min_workers: 1
+              max_workers: 6
+            node_type_id: i3.2xlarge
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+
+    # ── Monitoring ─────────────────────────────────────────────
+    monitoring_job:
+      name: "[${bundle.target}] Drift Monitoring"
+      schedule:
+        quartz_cron_expression: "0 0 8 ? * MON"  # weekly Monday 08:00 UTC
+        timezone_id: UTC
+      job_clusters:
+        - job_cluster_key: monitor_cluster
+          new_cluster:
+            num_workers: 1           # monitoring is lightweight — single worker
+            node_type_id: i3.xlarge
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+
+    # ── Maintenance: OPTIMIZE + VACUUM ─────────────────────────
+    maintenance_job:
+      name: "[${bundle.target}] Delta Maintenance"
+      schedule:
+        quartz_cron_expression: "0 0 3 ? * SUN"  # Sunday 03:00 UTC (cheapest window)
+        timezone_id: UTC
+      job_clusters:
+        - job_cluster_key: maintenance_cluster
+          new_cluster:
+            num_workers: 2
+            node_type_id: i3.xlarge
+            spark_version: 15.4.x-scala2.12
+            instance_pool_id: ${resources.instance_pools.ml_pool.id}
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      root_path: /Workspace/mlops-demo/dev
+    variables:
+      env: dev
+      max_workers: "4"
+
+  staging:
+    mode: development
+    workspace:
+      root_path: /Workspace/mlops-demo/staging
+    variables:
+      env: staging
+      max_workers: "8"
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/mlops-demo/prod
+    variables:
+      env: prod
+      max_workers: "20"

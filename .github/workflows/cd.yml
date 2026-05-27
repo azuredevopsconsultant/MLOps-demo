@@ -1,0 +1,57 @@
+name: CD — Deploy · Promote · Monitor
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, prod]
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false          # never cancel a deploy mid-flight
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install databricks-sdk --quiet
+      - name: Deploy bundle to staging
+        run: databricks bundle deploy --target staging
+        working-directory: databricks/asset_bundles
+      - name: Run integration smoke test
+        run: databricks bundle run smoke_test_job --target staging
+        working-directory: databricks/asset_bundles
+
+  deploy-prod:
+    name: Deploy → Prod
+    runs-on: ubuntu-latest
+    environment: production
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install databricks-sdk --quiet
+      - name: Deploy bundle to prod
+        run: databricks bundle deploy --target prod
+        working-directory: databricks/asset_bundles
+      - name: Trigger training pipeline
+        run: databricks bundle run training_job --target prod
+        working-directory: databricks/asset_bundles

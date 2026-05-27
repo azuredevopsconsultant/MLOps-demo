@@ -1,98 +1,88 @@
-# MLOps on Databricks — End-to-End Project
+# MLOps Demo — Databricks + AWS
 
-A production-grade MLOps pipeline implementing the full lifecycle for a **customer churn classifier** on Databricks + AWS.
+End-to-end MLOps platform on Databricks with AWS S3 as the storage backbone, following best practices for production ML systems with built-in cost optimisations.
 
 ## Architecture
 
 ```
-Raw S3 → Bronze → Silver → Gold → Feature Store → Train → Registry → Serve → Monitor → Retrain
+S3 Raw → Bronze (Delta) → Silver (Delta) → Gold (Delta) → Feature Store
+                                                                ↓
+                                               Training (MLflow + Hyperopt)
+                                                                ↓
+                                               MLflow Model Registry
+                                                      ↙        ↘
+                                      Batch Inference      Real-time Serving
+                                              ↓
+                                     Lakehouse Monitoring (drift detection)
 ```
 
-| Layer | Tool | What it does |
-|-------|------|--------------|
-| Ingestion | Databricks Autoloader | Incremental S3 → Delta Bronze |
-| Quality   | Delta Live Tables     | DQ checks, Silver cleansing |
-| Features  | Feature Engineering Client | Feature Store tables, time-travel |
-| Training  | MLflow + sklearn      | Experiment tracking, autolog |
-| Registry  | Unity Catalog Model Registry | Versioning, aliases, AUC gate |
-| CI/CD     | GitHub Actions + Asset Bundles | lint → test → staging → prod |
-| Serving   | Databricks Model Serving | REST endpoint, A/B, autoscale |
-| Monitoring| Lakehouse Monitoring  | Drift alerts, auto-retrain trigger |
+## Stack
 
-## Quick Start
+| Layer | Tool |
+|---|---|
+| Storage | AWS S3 + Delta Lake (medallion) |
+| Compute | Databricks (Spark 3.5, Photon) |
+| Orchestration | Databricks Workflows (DABs) |
+| Feature store | Databricks Feature Store |
+| Experiment tracking | MLflow |
+| CI/CD | GitHub Actions + Databricks Asset Bundles |
+| IaC | Terraform (S3, IAM, Cost Budgets) |
+| Monitoring | Databricks Lakehouse Monitoring |
 
-### 1. Clone and set up
+## Cost optimisations
+
+| Area | Strategy | Saving |
+|---|---|---|
+| Compute | SPOT_WITH_FALLBACK @ 80% bid | ~60% vs on-demand |
+| Compute | Shared instance pool (0 idle min) | Eliminates cold-start DBU waste |
+| Compute | availableNow trigger on Auto Loader | Cluster runs only while backlog exists |
+| Compute | Autoscaling 2→N (not fixed N) | Scales down when idle |
+| Storage | S3 Intelligent Tiering | Auto-moves cold data to IA/Glacier |
+| Storage | OPTIMIZE + VACUUM weekly | Compacts files; reclaims stale versions |
+| Storage | MERGE instead of overwrite | Writes only changed rows |
+| Storage | Z-ORDER on filter columns | 50-80% scan reduction → fewer DBUs |
+| Storage | Dynamic partition overwrite | Only rewrites changed partitions |
+| Infra | AWS Budget alerts at 80%/100% | No surprise bills |
+| CI/CD | cancel-in-progress on PRs | No wasted Actions minutes |
+| Training | SparkTrials parallelism=4 | Faster HPO → less cluster uptime |
+| Scheduling | Off-peak windows (02:00-06:00 UTC) | Spot availability highest, rates lowest |
+
+## Quick start
+
 ```bash
-git clone https://github.com/YOUR_ORG/mlops-databricks
-cd mlops-databricks
-pip install -r requirements-dev.txt
+# 1 — install deps
+make install
+
+# 2 — set credentials
+export DATABRICKS_HOST=https://your-workspace.azuredatabricks.net
+export DATABRICKS_TOKEN=your-token
+
+# 3 — deploy to dev
+make deploy-dev
+
+# 4 — run training
+make train
+
+# 5 — run tests
+make test
 ```
 
-### 2. Run unit tests locally
-```bash
-pytest tests/unit/ -v --cov=src
-```
+## Medallion layers & MLOps engineer responsibility
 
-### 3. Configure GitHub secrets
-In your GitHub repo → Settings → Secrets, add:
-- `DATABRICKS_HOST_DEV` / `_STAGING` / `_PROD`
-- `DATABRICKS_TOKEN_DEV` / `_STAGING` / `_PROD`
-- `SLACK_WEBHOOK_URL` (optional)
+| Layer | Written by | Read by | MLOps owns? |
+|---|---|---|---|
+| Bronze | MLOps (Auto Loader job) | Silver transform | Yes |
+| Silver | MLOps (transform job) | Feature engineering | Yes |
+| Gold | MLOps (feature job) | Training, Inference | Yes |
+| Feature Store | MLOps (feature store writer) | Data scientists (read-only) | Yes |
+| Predictions | MLOps (inference job) | BI / downstream | Yes |
 
-### 4. Configure workspaces
-Edit `databricks.yml` — set workspace hosts for each target environment.
+Data scientists consume `fs.create_training_set()` — they never touch Bronze or Silver directly.
 
-### 5. Deploy to dev
-```bash
-databricks auth login
-databricks bundle deploy --target dev
-databricks bundle run data_ingestion_job --target dev
-databricks bundle run feature_engineering_job --target dev
-databricks bundle run model_training_job --target dev
-```
+## Environments
 
-## Branch → Environment Mapping
-
-| Branch    | Environment | Trigger                       |
-|-----------|-------------|-------------------------------|
-| `dev`     | Development | Push (validate only)          |
-| `staging` | Staging     | Merge → full staging pipeline |
-| `main`    | Production  | Merge → requires manual approval |
-
-## Project Structure
-
-```
-mlops-databricks/
-├── databricks.yml                    ← Asset Bundle (jobs, experiments, serving)
-├── requirements-dev.txt
-├── src/
-│   ├── data_ingestion/
-│   │   ├── 01_bronze_ingestion.py    ← Autoloader → Bronze Delta
-│   │   ├── 02_silver_cleansing.py    ← DQ checks → Silver Delta
-│   │   └── 03_gold_aggregation.py    ← ML-ready Gold table
-│   ├── feature_engineering/
-│   │   └── 01_compute_features.py    ← Feature Store write + monitoring
-│   ├── model_training/
-│   │   ├── 01_train_model.py         ← MLflow training + autolog
-│   │   └── 02_register_model.py      ← UC Model Registry + AUC gate
-│   └── model_inference/
-│       └── 01_batch_inference.py     ← Scheduled batch scoring
-├── resources/
-│   └── promote_model.py              ← Challenger → champion promotion
-├── tests/
-│   ├── unit/
-│   │   └── test_pipeline.py          ← Pure Python, no cluster needed
-│   └── integration/                  ← Runs against staging cluster
-└── .github/workflows/
-    └── mlops_cicd.yml                ← Full CI/CD pipeline
-```
-
-## Key Best Practices Implemented
-
-- **AUC gate** in registration: model blocked if AUC < 0.75
-- **Challenger/champion** aliasing with automated promotion
-- **Feature consistency**: same Feature Store lookup at training and inference
-- **Data quality threshold**: pipeline fails if DQ failure rate > 5%
-- **Environment isolation**: dev / staging / prod Unity Catalog catalogs
-- **Blue-green deployment**: configured in Asset Bundle serving endpoint
-- **Manual approval gate**: GitHub environment protection on `production`
+| Env | Branch | Cluster | SPOT? | Max workers |
+|---|---|---|---|---|
+| dev | feature/* | i3.xlarge, 2 workers | No (dev speed) | 4 |
+| staging | staging | i3.2xlarge, autoscale | Yes | 8 |
+| prod | main | i3.4xlarge, autoscale | Yes (80% bid) | 20 |
