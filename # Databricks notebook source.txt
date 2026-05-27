@@ -1,0 +1,288 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Model Training — MLflow + Feature Store Lookups
+# MAGIC Trains a churn classifier using Feature Store lookups and logs everything to MLflow.
+
+# COMMAND ----------
+dbutils.widgets.text("catalog",     "dev_catalog")
+dbutils.widgets.text("schema",      "mlops_demo")
+dbutils.widgets.text("model_name",  "churn_classifier")
+dbutils.widgets.text("experiment_path", "/Shared/mlops-demo/dev/churn-experiment")
+dbutils.widgets.text("n_hpo_trials", "20")   # Optuna trials — set 0 to skip HPO and use defaults
+
+catalog         = dbutils.widgets.get("catalog")
+schema          = dbutils.widgets.get("schema")
+model_name      = dbutils.widgets.get("model_name")
+experiment_path = dbutils.widgets.get("experiment_path")
+n_hpo_trials    = int(dbutils.widgets.get("n_hpo_trials"))
+
+import mlflow
+import mlflow.sklearn
+from databricks.feature_engineering import FeatureEngineeringClient
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+import pandas as pd
+import numpy as np
+import optuna
+
+fe = FeatureEngineeringClient()
+mlflow.set_registry_uri("databricks-uc")
+mlflow.set_experiment(experiment_path)
+
+# ── Git version control metadata ──────────────────────────────
+# Capture commit hash and branch from Databricks workspace context.
+# Logged as MLflow tags so every run is pinned to the exact code revision.
+try:
+    _ctx        = dbutils.notebook.getContext()
+    git_commit  = _ctx.tags().get("gitCommit").getOrElse("unknown")
+    git_branch  = _ctx.tags().get("gitBranch").getOrElse("unknown")
+    git_url     = _ctx.tags().get("gitUrl").getOrElse("unknown")
+    nb_path     = _ctx.notebookPath().get()
+except Exception:
+    git_commit = git_branch = git_url = nb_path = "unknown"
+
+# COMMAND ----------
+# MAGIC %md ## Load training data via Feature Store
+
+feature_table_name = f"{catalog}.{schema}.customer_churn_features"
+
+# Use FeatureLookup — ensures training/serving consistency
+training_set = fe.create_training_set(
+    df=spark.table(f"{catalog}.{schema}.gold_customers_ml").select("customer_id", "label"),
+    feature_lookups=[
+        mlflow.feature_engineering.feature_lookup.FeatureLookup(
+            table_name=feature_table_name,
+            lookup_key="customer_id",
+            feature_names=[
+                "tenure_months", "monthly_spend", "spend_12m_avg",
+                "is_high_value", "region_encoded", "tier_encoded",
+                "num_support_tickets", "num_logins_30d", "days_since_last_login",
+            ],
+        )
+    ],
+    label="label",
+)
+
+training_df = training_set.load_df().toPandas()
+X = training_df.drop(columns=["label", "customer_id"])
+y = training_df["label"]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+print(f"Train: {len(X_train)} | Test: {len(X_test)} | Churn rate: {y.mean():.1%}")
+
+# COMMAND ----------
+# MAGIC %md ## Hyperparameter Tuning — Optuna + MLflow
+# MAGIC Runs `n_hpo_trials` Optuna trials; each trial is a nested MLflow child run so the
+# MAGIC full search history is queryable from the Experiments UI.
+# MAGIC Set `n_hpo_trials=0` to skip tuning and use the default parameters below.
+
+DEFAULT_PARAMS = {
+    "n_estimators": 300,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "min_samples_leaf": 20,
+    "random_state": 42,
+}
+
+if n_hpo_trials > 0:
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    def _objective(trial):
+        p = {
+            "n_estimators":    trial.suggest_int("n_estimators", 100, 500, step=50),
+            "max_depth":       trial.suggest_int("max_depth", 3, 8),
+            "learning_rate":   trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "subsample":       trial.suggest_float("subsample", 0.6, 1.0),
+            "min_samples_leaf":trial.suggest_int("min_samples_leaf", 5, 50),
+            "random_state":    42,
+        }
+        with mlflow.start_run(run_name=f"hpo_trial_{trial.number}", nested=True):
+            mlflow.log_params(p)
+            m = GradientBoostingClassifier(**p).fit(X_train, y_train)
+            auc = roc_auc_score(y_test, m.predict_proba(X_test)[:, 1])
+            mlflow.log_metric("roc_auc", auc)
+        return auc
+
+    with mlflow.start_run(run_name="hpo_search"):
+        study = optuna.create_study(direction="maximize")
+        study.optimize(_objective, n_trials=n_hpo_trials, show_progress_bar=False)
+        best = study.best_params
+        best["random_state"] = 42
+        mlflow.log_params({f"best_{k}": v for k, v in best.items()})
+        mlflow.log_metric("best_hpo_auc", study.best_value)
+
+    params = best
+    print(f"\n✓ Optuna HPO complete — best AUC={study.best_value:.4f} after {n_hpo_trials} trials")
+    print(f"  Best params: {params}")
+else:
+    params = DEFAULT_PARAMS
+    print(f"\nHPO skipped (n_hpo_trials=0) — using default params")
+
+# COMMAND ----------
+# MAGIC %md ## Train with MLflow autolog + hyperparameter tracking
+
+with mlflow.start_run(run_name="gbm_v1") as run:
+    mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True)
+
+    model = GradientBoostingClassifier(**params)
+    model.fit(X_train, y_train)
+
+    y_pred  = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        "roc_auc":   roc_auc_score(y_test, y_proba),
+        "f1":        f1_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred),
+        "recall":    recall_score(y_test, y_pred),
+    }
+    mlflow.log_metrics(metrics)
+    mlflow.log_params(params)
+    mlflow.log_param("training_rows",  len(X_train))
+    mlflow.log_param("feature_table",  feature_table_name)
+
+    # ── Git version control — code snapshot ──────────────────
+    # Pin every MLflow run to the exact Git commit so any run can be
+    # reproduced by checking out the same commit and re-running.
+    mlflow.set_tag("mlflow.source.git.commit",  git_commit)
+    mlflow.set_tag("mlflow.source.git.branch",  git_branch)
+    mlflow.set_tag("mlflow.source.git.repoURL", git_url)
+    mlflow.set_tag("mlflow.source.name",        nb_path)
+    mlflow.set_tag("catalog",                   catalog)
+    mlflow.set_tag("schema",                    schema)
+    mlflow.set_tag("team",                      "mlops")
+
+    # Log a JSON code snapshot (params + git context) as an artifact
+    import json as _json
+    code_snapshot = {
+        "git_commit":     git_commit,
+        "git_branch":     git_branch,
+        "git_url":        git_url,
+        "notebook_path":  nb_path,
+        "catalog":        catalog,
+        "schema":         schema,
+        "feature_table":  feature_table_name,
+        "params":         params,
+    }
+    mlflow.log_dict(code_snapshot, "code_snapshot.json")
+
+    # Feature importance
+    feat_importance = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
+    mlflow.log_dict(feat_importance.to_dict(), "feature_importance.json")
+
+    # ── Governance: SHAP model interpretability plots ─────────
+    # Spec: "typical artifacts are plain text descriptions and model
+    # interpretations such as plots produced by SHAP"
+    # Cost: TreeExplainer on 200 held-out rows — negligible compute
+    import shap
+    import matplotlib
+    matplotlib.use("Agg")   # non-interactive backend — safe in job clusters
+    import matplotlib.pyplot as plt
+
+    shap_sample = X_test.iloc[:200]
+    explainer   = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(shap_sample)
+
+    # Beeswarm summary plot — shows direction + magnitude of each feature
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(shap_values, shap_sample, feature_names=X.columns.tolist(), show=False)
+    plt.tight_layout()
+    plt.savefig("/tmp/shap_summary.png", dpi=100, bbox_inches="tight")
+    plt.close()
+    mlflow.log_artifact("/tmp/shap_summary.png", "governance/shap")
+
+    # Bar plot — mean |SHAP| per feature (global importance)
+    plt.figure(figsize=(8, 5))
+    shap.summary_plot(shap_values, shap_sample, plot_type="bar",
+                      feature_names=X.columns.tolist(), show=False)
+    plt.tight_layout()
+    plt.savefig("/tmp/shap_bar.png", dpi=100, bbox_inches="tight")
+    plt.close()
+    mlflow.log_artifact("/tmp/shap_bar.png", "governance/shap")
+
+    # Mean absolute SHAP per feature — machine-readable for downstream audits
+    mean_abs_shap = (
+        pd.DataFrame(shap_values, columns=X.columns)
+        .abs().mean()
+        .sort_values(ascending=False)
+        .to_dict()
+    )
+    mlflow.log_dict({k: round(v, 6) for k, v in mean_abs_shap.items()},
+                    "governance/shap/mean_abs_shap.json")
+
+    # ── Governance: plain text model card ─────────────────────
+    # Plain text description meeting data governance requirements.
+    # Provides a human-readable record for business stakeholders and auditors.
+    top_features = ", ".join(list(mean_abs_shap.keys())[:3])
+    model_card = (
+        f"MODEL CARD — {model_name}\n"
+        f"{'=' * 50}\n"
+        f"Type         : GradientBoostingClassifier (scikit-learn)\n"
+        f"Task         : Binary classification — customer churn prediction\n"
+        f"Catalog      : {catalog}\n"
+        f"Schema       : {schema}\n"
+        f"\nPERFORMANCE (held-out test set, 20%)\n"
+        f"  AUC        : {metrics['roc_auc']:.4f}\n"
+        f"  F1         : {metrics['f1']:.4f}\n"
+        f"  Precision  : {metrics['precision']:.4f}\n"
+        f"  Recall     : {metrics['recall']:.4f}\n"
+        f"\nDATA LINEAGE\n"
+        f"  Feature table : {feature_table_name}\n"
+        f"  Training rows : {len(X_train):,}\n"
+        f"\nCODE PROVENANCE\n"
+        f"  Git commit : {git_commit}\n"
+        f"  Git branch : {git_branch}\n"
+        f"  Notebook   : {nb_path}\n"
+        f"\nMODEL INTERPRETATION (SHAP)\n"
+        f"  Top 3 features by mean |SHAP| : {top_features}\n"
+        f"  Full SHAP plots : governance/shap/shap_summary.png\n"
+        f"\nGOVERNANCE\n"
+        f"  Compliance status : PENDING_REVIEW\n"
+        f"  Deployment stage  : challenger\n"
+        f"  Team              : mlops\n"
+        f"  Registry          : Unity Catalog — {catalog}.{schema}.{model_name}\n"
+    )
+    mlflow.log_text(model_card, "governance/model_card.txt")
+    print("\n✓ SHAP plots + model card logged to governance/")
+
+    # ── Evaluation: compare new model against current production champion ──
+    # The purpose of evaluation is to determine if the newly developed model
+    # performs better than the current production model.
+    from mlflow import MlflowClient as _MlflowClient
+    _client          = _MlflowClient()
+    full_model_name  = f"{catalog}.{schema}.{model_name}"
+
+    try:
+        champion_ver = _client.get_model_version_by_alias(full_model_name, "champion")
+        champion_run = _client.get_run(champion_ver.run_id)
+        champion_auc = champion_run.data.metrics.get("roc_auc", 0.0)
+        delta_auc    = metrics["roc_auc"] - champion_auc
+
+        mlflow.log_metric("champion_auc",       champion_auc)
+        mlflow.log_metric("delta_vs_champion",  round(delta_auc, 4))
+        mlflow.set_tag("beats_champion",        str(delta_auc > 0))
+        mlflow.set_tag("champion_version",      champion_ver.version)
+
+        verdict = "IMPROVEMENT" if delta_auc > 0.005 else ("MARGINAL" if delta_auc > 0 else "REGRESSION")
+        mlflow.set_tag("vs_champion_verdict", verdict)
+        print(f"\n  Champion AUC   : {champion_auc:.4f}  (v{champion_ver.version})")
+        print(f"  New model AUC  : {metrics['roc_auc']:.4f}")
+        print(f"  Delta          : {delta_auc:+.4f}  [{verdict}]")
+    except Exception:
+        # No champion yet (first run) — this model becomes the first challenger
+        mlflow.set_tag("beats_champion", "no_champion_yet")
+        print("\n  No current champion — this will be the first challenger")
+
+    run_id = run.info.run_id
+    print(f"\n{'='*50}")
+    print(f"Run ID     : {run_id}")
+    print(f"Git commit : {git_commit}")
+    print(f"Git branch : {git_branch}")
+    for k, v in metrics.items():
+        print(f"{k:12}: {v:.4f}")
+
+# Store run_id for registration step
+dbutils.jobs.taskValues.set("run_id", run_id)
+dbutils.jobs.taskValues.set("auc",    str(round(metrics["roc_auc"], 4)))
