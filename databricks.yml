@@ -1,0 +1,1097 @@
+bundle:
+  name: mlops-databricks
+
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: dev_catalog
+  schema:
+    description: Schema/database name
+    default: mlops_demo
+  model_name:
+    description: Registered model name
+    default: churn_classifier
+  delta_dynamodb_table:
+    description: DynamoDB table name for Delta Lake S3 concurrent write safety (output of Terraform)
+    default: mlops-dev-delta-lake-lock
+  aws_region:
+    description: AWS region
+    default: us-east-1
+  git_repo_url:
+    description: GitHub repository URL — used for Databricks Git folder sync
+    default: https://github.com/your-org/mlops-databricks
+  alert_email:
+    description: Team email address for job failure / health alerts
+    default: mlops-team@your-company.com
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TARGETS
+# ─────────────────────────────────────────────────────────────────────────────
+# dev     — local development, no notifications, SPOT everywhere
+# staging — integration testing, failure alerts, SPOT (cost over reliability)
+# prod    — ON_DEMAND for critical jobs, start+failure+success alerts, health gates
+# ═══════════════════════════════════════════════════════════════════════════════
+targets:
+
+  # ─────────────────── DEV ────────────────────────────────────────────────────
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: dev_catalog
+    workspace:
+      host: ${var.DATABRICKS_HOST_DEV}
+      root_path: /Repos/mlops-demo/dev
+
+  # ─────────────────── STAGING ────────────────────────────────────────────────
+  # All base clusters run SPOT — acceptable for test/integration workloads.
+  # Notifications added so engineers know when staging breaks before prod deploy.
+  # max_concurrent_runs: 2 lets parallel staging test runs proceed.
+  staging:
+    mode: staging
+    variables:
+      catalog: staging_catalog
+      delta_dynamodb_table: mlops-staging-delta-lake-lock
+    workspace:
+      host: ${var.DATABRICKS_HOST_STAGING}
+      root_path: /Repos/mlops-demo/staging
+    resources:
+      jobs:
+        data_ingestion_job:
+          max_concurrent_runs: 2
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        feature_engineering_job:
+          max_concurrent_runs: 2
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        model_training_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        batch_inference_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        monitoring_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        operational_monitoring_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        serving_health_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        trigger_retraining_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        scheduled_retraining_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        governance_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        delta_maintenance_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        ground_truth_feedback_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+        canary_promote_job:
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+
+  # ─────────────────── PRODUCTION ─────────────────────────────────────────────
+  # Critical path jobs (ingestion, features, training, inference, retraining):
+  #   availability: ON_DEMAND — SPOT interruption mid-run would discard progress
+  #   min_workers: 2          — higher floor prevents cold-start latency spikes
+  #   custom_tags              — cost attribution via AWS Cost Explorer
+  #   health.rules             — auto-fail stuck/hung jobs before the next schedule
+  #   max_concurrent_runs: 1  — prevents duplicate prod runs
+  #
+  # Monitoring / lightweight jobs (monitoring, serving health):
+  #   availability: SPOT_WITH_FALLBACK — non-critical, re-run on failure is fine
+  #   ~60-70% cost saving on these always-on daily/hourly jobs
+  prod:
+    mode: production
+    variables:
+      catalog: prod_catalog
+      delta_dynamodb_table: mlops-prod-delta-lake-lock
+    workspace:
+      host: ${var.DATABRICKS_HOST_PROD}
+      root_path: /Repos/mlops-demo/prod
+    resources:
+      jobs:
+
+        # ── PROD: Data Ingestion ─────────────────────────────────────────────
+        # ON_DEMAND: feeds the Gold table consumed by training & inference SLAs
+        data_ingestion_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_start:
+              - ${var.alert_email}
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 3600           # alert if ingestion exceeds 1 h
+          job_clusters:
+            - job_cluster_key: ingestion_cluster
+              new_cluster:
+                spark_version: "15.4.x-ml-scala2.12"
+                node_type_id: m5.xlarge
+                autoscale:
+                  min_workers: 2      # higher floor for prod SLA
+                  max_workers: 6
+                custom_tags:
+                  env: prod
+                  cost_center: mlops
+                  team: data-engineering
+                aws_attributes:
+                  availability: ON_DEMAND
+                spark_conf:
+                  spark.databricks.delta.optimizeWrite.enabled: "true"
+                  spark.databricks.delta.autoCompact.enabled: "true"
+                  spark.databricks.delta.logStore.s3.dynamoDBTable: ${var.delta_dynamodb_table}
+                  spark.databricks.delta.logStore.s3.region: ${var.aws_region}
+                autotermination_minutes: 30
+
+        # ── PROD: Feature Engineering ────────────────────────────────────────
+        # ON_DEMAND: feature table staleness directly impacts model quality
+        feature_engineering_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 3600
+          job_clusters:
+            - job_cluster_key: feature_cluster
+              new_cluster:
+                spark_version: "15.4.x-ml-scala2.12"
+                node_type_id: m5.xlarge
+                autoscale:
+                  min_workers: 2
+                  max_workers: 6
+                custom_tags:
+                  env: prod
+                  cost_center: mlops
+                  team: data-science
+                aws_attributes:
+                  availability: ON_DEMAND
+                spark_conf:
+                  spark.databricks.delta.optimizeWrite.enabled: "true"
+                  spark.databricks.delta.logStore.s3.dynamoDBTable: ${var.delta_dynamodb_table}
+                  spark.databricks.delta.logStore.s3.region: ${var.aws_region}
+                autotermination_minutes: 30
+
+        # ── PROD: Model Training ─────────────────────────────────────────────
+        # Training cluster ON_DEMAND: SPOT eviction mid-run discards entire run.
+        # API cluster stays SPOT: MLflow API calls are idempotent + fast.
+        # Retry on timeout (1×, 5 min backoff) — covers transient Spark failures.
+        # on_success notification: confirms challenger model is ready for review.
+        model_training_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_start:
+              - ${var.alert_email}
+            on_success:
+              - ${var.alert_email}
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 7200           # fail if training exceeds 2 h
+          job_clusters:
+            - job_cluster_key: training_cluster
+              new_cluster:
+                spark_version: "15.4.x-ml-scala2.12"
+                node_type_id: m5.2xlarge
+                num_workers: 4        # prod: more parallelism for Feature Store join
+                custom_tags:
+                  env: prod
+                  cost_center: mlops
+                  team: data-science
+                aws_attributes:
+                  availability: ON_DEMAND
+                autotermination_minutes: 120
+            - job_cluster_key: api_cluster
+              new_cluster:
+                spark_version: "15.4.x-ml-scala2.12"
+                node_type_id: m5.large
+                num_workers: 0
+                spark_conf:
+                  spark.databricks.cluster.profile: singleNode
+                  spark.master: "local[*]"
+                custom_tags:
+                  env: prod
+                  cost_center: mlops
+                aws_attributes:
+                  availability: SPOT_WITH_FALLBACK
+                  spot_bid_price_percent: 100
+                autotermination_minutes: 20
+          tasks:
+            - task_key: train_model
+              job_cluster_key: training_cluster
+              retry_on_timeout: true
+              max_retries: 1
+              min_retry_interval_millis: 300000
+              notebook_task:
+                notebook_path: ./src/model_training/01_train_model.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  schema: ${var.schema}
+                  model_name: ${var.model_name}
+                  experiment_path: /Shared/mlops-demo/prod/churn-experiment
+                  n_hpo_trials: "30"   # prod: full HPO sweep
+            - task_key: register_model
+              depends_on:
+                - task_key: train_model
+              job_cluster_key: api_cluster
+              notebook_task:
+                notebook_path: ./src/model_training/02_register_model.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  schema: ${var.schema}
+                  model_name: ${var.model_name}
+            - task_key: compliance_check
+              depends_on:
+                - task_key: register_model
+              job_cluster_key: api_cluster
+              notebook_task:
+                notebook_path: ./src/model_training/03_compliance_check.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  schema: ${var.schema}
+                  model_name: ${var.model_name}
+                  max_parity_gap: "0.08"    # prod stricter parity gate (vs 0.10 in dev)
+            - task_key: validate_model
+              depends_on:
+                - task_key: compliance_check
+              job_cluster_key: api_cluster
+              notebook_task:
+                notebook_path: ./src/model_inference/02_model_validation.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  schema: ${var.schema}
+                  model_name: ${var.model_name}
+                  min_auc: "0.78"           # prod gate stricter than dev (0.75)
+                  min_precision: "0.62"
+                  min_recall: "0.57"
+            - task_key: deploy_to_dev
+              depends_on:
+                - task_key: validate_model
+              job_cluster_key: api_cluster
+              notebook_task:
+                notebook_path: ./src/model_training/04_deploy_to_dev.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  schema: ${var.schema}
+                  model_name: ${var.model_name}
+                  endpoint_workload_size: "Medium"  # prod: larger endpoint workload
+
+        # ── PROD: Batch Inference ────────────────────────────────────────────
+        # ON_DEMAND: downstream CRM systems rely on daily predictions SLA.
+        # Retry on timeout (1×, 5 min backoff) — covers transient network issues.
+        # autoscale 2-8: handles end-of-month surges in customer population.
+        batch_inference_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 3600
+          job_clusters:
+            - job_cluster_key: inference_cluster
+              new_cluster:
+                spark_version: "15.4.x-ml-scala2.12"
+                node_type_id: m5.xlarge
+                autoscale:
+                  min_workers: 2
+                  max_workers: 8        # prod: larger range for full population
+                custom_tags:
+                  env: prod
+                  cost_center: mlops
+                  team: data-engineering
+                aws_attributes:
+                  availability: ON_DEMAND
+                spark_conf:
+                  spark.databricks.delta.logStore.s3.dynamoDBTable: ${var.delta_dynamodb_table}
+                  spark.databricks.delta.logStore.s3.region: ${var.aws_region}
+                autotermination_minutes: 45
+          tasks:
+            - task_key: run_inference
+              job_cluster_key: inference_cluster
+              retry_on_timeout: true
+              max_retries: 1
+              min_retry_interval_millis: 300000
+              notebook_task:
+                notebook_path: ./src/model_inference/01_batch_inference.py
+                base_parameters:
+                  catalog: ${var.catalog}
+                  schema: ${var.schema}
+                  model_name: ${var.model_name}
+
+        # ── PROD: Monitoring ─────────────────────────────────────────────────
+        # SPOT acceptable: monitoring failure is logged, not customer-impacting.
+        # health gate at 30 min prevents silent hangs consuming DBUs.
+        monitoring_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 1800
+
+        operational_monitoring_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 1800
+
+        # ── PROD: Serving Health ─────────────────────────────────────────────
+        # SPOT ok — runs hourly, probe is idempotent, automatic failover handles degraded endpoint.
+        serving_health_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+
+        # ── PROD: Retraining ─────────────────────────────────────────────────
+        # Trigger: SPOT ok — just reads log + fires a job API call.
+        # Scheduled: ON_DEMAND weekly — retraining is equivalent to training in risk/cost.
+        trigger_retraining_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+
+        scheduled_retraining_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_start:
+              - ${var.alert_email}
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 7200
+
+        governance_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+
+        delta_maintenance_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 3600           # alert if weekly maintenance exceeds 1 h
+
+        # ── PROD: Ground Truth Feedback ──────────────────────────────────────
+        ground_truth_feedback_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          health:
+            rules:
+              - metric: RUN_DURATION_SECONDS
+                op: GREATER_THAN
+                value: 1800
+
+        # ── PROD: Canary Promote ─────────────────────────────────────────────
+        canary_promote_job:
+          max_concurrent_runs: 1
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+            on_success:
+              - ${var.alert_email}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BASE JOB DEFINITIONS (all targets inherit these unless overridden above)
+# ═══════════════════════════════════════════════════════════════════════════════
+resources:
+  # ── Instance Pool — pre-warmed SPOT m5.large for all single-node jobs ─────────
+  # Reduces cold-start from ~5 min to ~30 s for monitoring/canary/governance jobs.
+  # max_capacity: 15 — enough for all lightweight jobs running in parallel.
+  instance_pools:
+    spot_single_node:
+      instance_pool_name: "[${bundle.target}] Spot Single-Node Pool"
+      node_type_id: m5.large
+      aws_attributes:
+        availability: SPOT_WITH_FALLBACK
+        spot_bid_price_percent: 100
+      min_idle_instances: 0
+      max_capacity: 15
+      idle_instance_autotermination_minutes: 20
+      preloaded_spark_versions:
+        - "15.4.x-ml-scala2.12"
+
+  jobs:
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Data Ingestion — Bronze → Silver → Gold
+    # ──────────────────────────────────────────────────────────────────────────
+    data_ingestion_job:
+      name: "[${bundle.target}] Data Ingestion Pipeline"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: ingestion
+      job_clusters:
+        - job_cluster_key: ingestion_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            node_type_id: m5.xlarge
+            autoscale:
+              min_workers: 1
+              max_workers: 3
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.autoCompact.enabled: "true"
+              spark.databricks.delta.logStore.s3.dynamoDBTable: ${var.delta_dynamodb_table}
+              spark.databricks.delta.logStore.s3.region: ${var.aws_region}
+              spark.sql.adaptive.enabled: "true"
+              spark.sql.adaptive.coalescePartitions.enabled: "true"
+              spark.sql.adaptive.skewJoin.enabled: "true"
+            aws_attributes:
+              availability: SPOT_WITH_FALLBACK
+              spot_bid_price_percent: 100
+            autotermination_minutes: 30
+      tasks:
+        - task_key: bronze_ingestion
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: ./src/data_ingestion/01_bronze_ingestion.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+        - task_key: silver_cleansing
+          depends_on:
+            - task_key: bronze_ingestion
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: ./src/data_ingestion/02_silver_cleansing.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+        - task_key: gold_aggregation
+          depends_on:
+            - task_key: silver_cleansing
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: ./src/data_ingestion/03_gold_aggregation.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Feature Engineering
+    # ──────────────────────────────────────────────────────────────────────────
+    feature_engineering_job:
+      name: "[${bundle.target}] Feature Engineering"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: features
+      job_clusters:
+        - job_cluster_key: feature_cluster
+          new_cluster:
+            spark_version: "15.4.x-photon-scala2.12"   # Photon: columnar vectorisation speeds up feature joins
+            node_type_id: m5.xlarge
+            autoscale:
+              min_workers: 1
+              max_workers: 4
+            spark_conf:
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.logStore.s3.dynamoDBTable: ${var.delta_dynamodb_table}
+              spark.databricks.delta.logStore.s3.region: ${var.aws_region}
+              spark.sql.adaptive.enabled: "true"
+              spark.sql.adaptive.coalescePartitions.enabled: "true"
+              spark.sql.adaptive.skewJoin.enabled: "true"
+              spark.sql.shuffle.partitions: "200"        # AQE overrides this dynamically; explicit baseline
+              spark.sql.autoBroadcastJoinThreshold: "209715200"   # 200 MB — broadcast small feature lookups
+            aws_attributes:
+              availability: SPOT_WITH_FALLBACK
+              spot_bid_price_percent: 100
+            autotermination_minutes: 30
+      tasks:
+        - task_key: compute_features
+          job_cluster_key: feature_cluster
+          notebook_task:
+            notebook_path: ./src/feature_engineering/01_compute_features.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Model Training — Databricks Recommended MLOps Workflow (5-step pipeline)
+    #
+    # Diagram: Train & Tune → Evaluate → Compliance Checks → Pre-deployment → Deploy
+    #
+    # Task mapping:
+    #   train_model       = "Training and tuning" + "Evaluation"  (MLflow autolog)
+    #   register_model    = UC Model Registry registration         (PENDING_REVIEW)
+    #   compliance_check  = "Compliance checks"   (bias/fairness/tags/SHAP gate)
+    #   validate_model    = "Pre-deployment checks" (AUC/precision/recall gate)
+    #   deploy_to_dev     = "Deploy to dev"        (sets alias, creates endpoint)
+    #
+    # On any gate failure: pipeline stops, compliance_status / validation_status
+    # tag is updated on the model version for full audit trail.
+    # ──────────────────────────────────────────────────────────────────────────
+    model_training_job:
+      name: "[${bundle.target}] Model Training"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: training
+        workflow: databricks-recommended-mlops
+      job_clusters:
+        - job_cluster_key: training_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            node_type_id: m5.2xlarge
+            num_workers: 2
+            spark_conf:
+              spark.sql.shuffle.partitions: "200"        # AQE coalesces at runtime; baseline for 8-core m5.2xlarge
+              spark.sql.autoBroadcastJoinThreshold: "209715200"   # broadcast feature lookup tables
+            aws_attributes:
+              availability: SPOT_WITH_FALLBACK
+              spot_bid_price_percent: 100
+            autotermination_minutes: 60
+        - job_cluster_key: api_cluster   # lightweight — MLflow API, SDK calls only
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 20
+      tasks:
+        # ── Step 1: Training and Tuning + Evaluation ────────────────────────
+        - task_key: train_model
+          job_cluster_key: training_cluster
+          notebook_task:
+            notebook_path: ./src/model_training/01_train_model.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              experiment_path: /Shared/mlops-demo/${bundle.target}/churn-experiment
+              n_hpo_trials: "20"   # dev/staging: 20 Optuna trials
+
+        # ── Step 2: Register to Unity Catalog (compliance_status=PENDING_REVIEW)
+        - task_key: register_model
+          depends_on:
+            - task_key: train_model
+          job_cluster_key: api_cluster
+          notebook_task:
+            notebook_path: ./src/model_training/02_register_model.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+
+        # ── Step 3: Compliance Checks ────────────────────────────────────────
+        # Bias/fairness parity, prohibited features, SHAP/model card, regulatory tags
+        # Updates compliance_status: PENDING_REVIEW → APPROVED or COMPLIANCE_FAILED
+        - task_key: compliance_check
+          depends_on:
+            - task_key: register_model
+          job_cluster_key: api_cluster
+          notebook_task:
+            notebook_path: ./src/model_training/03_compliance_check.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              max_parity_gap: "0.10"
+
+        # ── Step 4: Pre-Deployment Checks ───────────────────────────────────
+        # AUC / precision / recall gates on held-out validation set
+        # Updates model_validation_status: PENDING → PASSED or FAILED
+        - task_key: validate_model
+          depends_on:
+            - task_key: compliance_check
+          job_cluster_key: api_cluster
+          notebook_task:
+            notebook_path: ./src/model_inference/02_model_validation.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              min_auc: "0.75"
+              min_precision: "0.60"
+              min_recall: "0.55"
+
+        # ── Step 5: Deploy to Environment ───────────────────────────────────
+        # Sets "challenger" alias, creates/updates serving endpoint
+        # Fails fast if compliance_status ≠ APPROVED or validation_status ≠ PASSED
+        - task_key: deploy_to_dev
+          depends_on:
+            - task_key: validate_model
+          job_cluster_key: api_cluster
+          notebook_task:
+            notebook_path: ./src/model_training/04_deploy_to_dev.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              endpoint_workload_size: "Small"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Batch Inference
+    # ──────────────────────────────────────────────────────────────────────────
+    batch_inference_job:
+      name: "[${bundle.target}] Batch Inference"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: inference
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: inference_cluster
+          new_cluster:
+            spark_version: "15.4.x-photon-scala2.12"   # Photon: vectorised scoring over full customer population
+            node_type_id: m5.xlarge
+            autoscale:
+              min_workers: 1
+              max_workers: 4
+            spark_conf:
+              spark.databricks.delta.logStore.s3.dynamoDBTable: ${var.delta_dynamodb_table}
+              spark.databricks.delta.logStore.s3.region: ${var.aws_region}
+              spark.sql.sources.partitionOverwriteMode: dynamic
+              spark.sql.adaptive.enabled: "true"
+              spark.sql.adaptive.coalescePartitions.enabled: "true"
+              spark.sql.adaptive.skewJoin.enabled: "true"
+              spark.sql.shuffle.partitions: "200"
+              spark.sql.autoBroadcastJoinThreshold: "209715200"
+            aws_attributes:
+              availability: SPOT_WITH_FALLBACK
+              spot_bid_price_percent: 100
+            autotermination_minutes: 30
+      tasks:
+        - task_key: run_inference
+          job_cluster_key: inference_cluster
+          notebook_task:
+            notebook_path: ./src/model_inference/01_batch_inference.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Model & Data Monitoring
+    # ──────────────────────────────────────────────────────────────────────────
+    monitoring_job:
+      name: "[${bundle.target}] Model & Data Monitoring"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: monitoring
+      schedule:
+        quartz_cron_expression: "0 0 7 * * ?"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: monitoring_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 20
+      tasks:
+        - task_key: run_monitoring
+          job_cluster_key: monitoring_cluster
+          notebook_task:
+            notebook_path: ./src/monitoring/01_model_monitoring.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              drift_threshold: "0.10"
+              perf_threshold: "0.70"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Operational Monitoring
+    # ──────────────────────────────────────────────────────────────────────────
+    operational_monitoring_job:
+      name: "[${bundle.target}] Operational Monitoring"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+      schedule:
+        quartz_cron_expression: "0 30 7 * * ?"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: ops_monitor_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 20
+      tasks:
+        - task_key: run_operational_monitoring
+          job_cluster_key: ops_monitor_cluster
+          notebook_task:
+            notebook_path: ./src/monitoring/02_operational_monitoring.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              lookback_days: "7"
+              max_duration_mins: "120"
+              max_dbu_daily: "50"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Serving Endpoint Health
+    # ──────────────────────────────────────────────────────────────────────────
+    serving_health_job:
+      name: "[${bundle.target}] Serving Endpoint Health"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: serving_monitor_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 15
+      tasks:
+        - task_key: run_serving_health
+          job_cluster_key: serving_monitor_cluster
+          notebook_task:
+            notebook_path: ./src/monitoring/03_serving_monitoring.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              max_latency_p95_ms: "500"
+              max_error_rate: "0.05"
+              probe_requests: "10"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Trigger-Based Retraining
+    # ──────────────────────────────────────────────────────────────────────────
+    trigger_retraining_job:
+      name: "[${bundle.target}] Trigger-Based Retraining"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+      schedule:
+        quartz_cron_expression: "0 0 8 * * ?"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: trigger_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 15
+      tasks:
+        - task_key: check_and_trigger
+          job_cluster_key: trigger_cluster
+          notebook_task:
+            notebook_path: ./src/retraining/01_trigger_retraining.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              drift_threshold: "0.10"
+              perf_threshold: "0.70"
+              lookback_hours: "26"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Scheduled Weekly Retraining
+    # ──────────────────────────────────────────────────────────────────────────
+    scheduled_retraining_job:
+      name: "[${bundle.target}] Scheduled Weekly Retraining"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+      schedule:
+        quartz_cron_expression: "0 0 2 ? * MON"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: scheduler_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 120
+      tasks:
+        - task_key: run_scheduled_retraining
+          job_cluster_key: scheduler_cluster
+          notebook_task:
+            notebook_path: ./src/retraining/02_scheduled_retraining.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              min_training_rows: "1000"
+              freshness_max_age_h: "25"
+              min_retrain_interval_days: "6"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # EDA & AutoML Baseline — manual trigger only
+    # ──────────────────────────────────────────────────────────────────────────
+    eda_job:
+      name: "[${bundle.target}] EDA & AutoML Baseline"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+      job_clusters:
+        - job_cluster_key: eda_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 30
+      tasks:
+        - task_key: exploratory_analysis
+          job_cluster_key: eda_cluster
+          notebook_task:
+            notebook_path: ./src/eda/01_exploratory_analysis.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+        - task_key: automl_baseline
+          depends_on:
+            - task_key: exploratory_analysis
+          job_cluster_key: eda_cluster
+          notebook_task:
+            notebook_path: ./src/eda/02_automl_baseline.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              max_trials: "10"
+              timeout_minutes: "20"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Access Controls & Governance — manual trigger
+    # ──────────────────────────────────────────────────────────────────────────
+    governance_job:
+      name: "[${bundle.target}] Access Controls & Governance"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+      job_clusters:
+        - job_cluster_key: governance_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 20
+      tasks:
+        - task_key: scim_provisioning
+          job_cluster_key: governance_cluster
+          notebook_task:
+            notebook_path: ./src/governance/01_scim_provisioning.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+        - task_key: delta_access_controls
+          depends_on:
+            - task_key: scim_provisioning
+          job_cluster_key: governance_cluster
+          notebook_task:
+            notebook_path: ./src/governance/02_delta_access_controls.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Delta Maintenance — weekly OPTIMIZE + VACUUM on Silver/Gold tables
+    # Runs Sunday 01:00 UTC — before the weekly retraining job (Monday 02:00).
+    # Ensures training data is compacted and stale files cleaned before training.
+    # ──────────────────────────────────────────────────────────────────────────
+    delta_maintenance_job:
+      name: "[${bundle.target}] Delta Table Maintenance"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: maintenance
+      schedule:
+        quartz_cron_expression: "0 0 1 ? * SUN"   # Sunday 01:00 UTC
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: maintenance_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+              spark.databricks.delta.vacuum.parallelDelete.enabled: "true"
+            autotermination_minutes: 60
+      tasks:
+        - task_key: run_delta_maintenance
+          job_cluster_key: maintenance_cluster
+          notebook_task:
+            notebook_path: ./src/maintenance/01_delta_maintenance.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              vacuum_retain_hours: "168"
+              growth_threshold_pct: "5"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Ground Truth Feedback Loop — daily at 09:00 UTC
+    # Joins predictions to actual outcomes, computes live AUC, tags model,
+    # triggers retraining if live AUC falls below threshold.
+    # Runs AFTER batch inference (06:00) and monitoring (07:00).
+    # ──────────────────────────────────────────────────────────────────────────
+    ground_truth_feedback_job:
+      name: "[${bundle.target}] Ground Truth Feedback Loop"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: feedback
+      schedule:
+        quartz_cron_expression: "0 0 9 * * ?"
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: feedback_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 30
+      tasks:
+        - task_key: compute_live_metrics
+          job_cluster_key: feedback_cluster
+          notebook_task:
+            notebook_path: ./src/model_inference/03_ground_truth_feedback.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              outcome_lag_days: "30"
+              lookback_days: "90"
+              live_auc_threshold: "0.68"
+              min_sample_size: "200"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Canary Promotion — runs every 6 hours
+    # Monitors the live canary and either increases traffic, rolls back,
+    # or fully promotes the challenger based on live AUC + error rate.
+    # Safe to run when no canary is active (exits early as no-op).
+    # ──────────────────────────────────────────────────────────────────────────
+    canary_promote_job:
+      name: "[${bundle.target}] Canary Promote / Rollback"
+      tags:
+        team: mlops
+        env: ${bundle.target}
+        pipeline: canary
+      schedule:
+        quartz_cron_expression: "0 0 */6 * * ?"   # every 6 hours
+        timezone_id: "UTC"
+      job_clusters:
+        - job_cluster_key: canary_cluster
+          new_cluster:
+            spark_version: "15.4.x-ml-scala2.12"
+            instance_pool_id: ${resources.instance_pools.spot_single_node.id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            autotermination_minutes: 15
+      tasks:
+        - task_key: promote_or_rollback
+          job_cluster_key: canary_cluster
+          notebook_task:
+            notebook_path: ./src/model_training/05_canary_promote.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              model_name: ${var.model_name}
+              step_pct: "20"
+              auc_tolerance: "0.02"
+              max_error_rate: "0.05"
+              min_soak_hours: "6"
+              min_canary_requests: "50"
+
+  experiments:
+    churn_experiment:
+      name: /Shared/mlops-demo/${bundle.target}/churn-experiment
+
+  model_serving_endpoints:
+    churn_serving:
+      name: churn-classifier-${bundle.target}
+      config:
+        served_models:
+          - model_name: ${var.catalog}.${var.schema}.${var.model_name}
+            model_version: "1"
+            workload_size: Small
+            scale_to_zero_enabled: true
